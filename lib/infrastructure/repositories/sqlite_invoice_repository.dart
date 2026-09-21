@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:sqflite/sqflite.dart';
 
 import '../../domain/entities/dashboard_stats.dart';
@@ -16,6 +17,14 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
   SqliteInvoiceRepository(this._database);
 
   final AppDatabase _database;
+
+  static const String _invoiceSelect = '''
+      SELECT i.*, s.name AS supplier_name, s.tax_id AS supplier_tax_id,
+             COALESCE(c.name, 'Sin categoría') AS category_name
+      FROM invoices i
+      JOIN suppliers s ON s.id = i.supplier_id
+      LEFT JOIN categories c ON c.id = i.category_id
+  ''';
 
   @override
   Future<List<Invoice>> findAll({
@@ -43,11 +52,7 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
     }
 
     final rows = await db.rawQuery('''
-      SELECT i.*, s.name AS supplier_name, s.tax_id AS supplier_tax_id,
-             COALESCE(c.name, 'Sin categoría') AS category_name
-      FROM invoices i
-      JOIN suppliers s ON s.id = i.supplier_id
-      LEFT JOIN categories c ON c.id = i.category_id
+      $_invoiceSelect
       ${clauses.isEmpty ? '' : 'WHERE ${clauses.join(' AND ')}'}
       ORDER BY i.issue_date DESC, i.id DESC
     ''', args);
@@ -57,17 +62,45 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
   @override
   Future<Invoice?> findById(int id) async {
     final db = await _database.instance;
+    final rows = await db.rawQuery('$_invoiceSelect WHERE i.id = ? LIMIT 1', [
+      id,
+    ]);
+    if (rows.isEmpty) return null;
+    return _hydrateInvoice(db, rows.first);
+  }
+
+  @override
+  Future<Invoice?> findDuplicate({
+    required String number,
+    required String supplierName,
+    required DateTime issueDate,
+    int? excludingId,
+  }) async {
+    final trimmedNumber = number.trim();
+    final trimmedSupplier = supplierName.trim();
+    // Without a number there is nothing distinctive enough to match on.
+    if (trimmedNumber.isEmpty || trimmedSupplier.isEmpty) return null;
+
+    final db = await _database.instance;
+    final day = DateTime(issueDate.year, issueDate.month, issueDate.day);
+    final nextDay = day.add(const Duration(days: 1));
     final rows = await db.rawQuery(
       '''
-      SELECT i.*, s.name AS supplier_name, s.tax_id AS supplier_tax_id,
-             COALESCE(c.name, 'Sin categoría') AS category_name
-      FROM invoices i
-      JOIN suppliers s ON s.id = i.supplier_id
-      LEFT JOIN categories c ON c.id = i.category_id
-      WHERE i.id = ?
+      $_invoiceSelect
+      WHERE i.invoice_number = ?
+        AND s.name = ? COLLATE NOCASE
+        AND i.issue_date >= ? AND i.issue_date < ?
+        AND (? IS NULL OR i.id <> ?)
       LIMIT 1
     ''',
-      [id],
+      [
+        trimmedNumber,
+        trimmedSupplier,
+        day.toIso8601String(),
+        nextDay.toIso8601String(),
+        excludingId,
+        excludingId,
+      ],
     );
     if (rows.isEmpty) return null;
     return _hydrateInvoice(db, rows.first);
@@ -109,7 +142,7 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
       paymentMethod: row['payment_method']! as String,
       qrContent: row['qr_content']! as String,
       rawOcrText: row['raw_ocr_text']! as String,
-      status: InvoiceStatus.values.byName(row['status']! as String),
+      status: _statusFrom(row['status']),
       createdAt: DateTime.parse(row['created_at']! as String),
       items: itemRows
           .map(
@@ -139,10 +172,23 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
     );
   }
 
+  /// A status the enum does not know about must not take the whole list down.
+  static InvoiceStatus _statusFrom(Object? value) {
+    final name = value as String?;
+    return InvoiceStatus.values.firstWhere(
+      (status) => status.name == name,
+      orElse: () => InvoiceStatus.draft,
+    );
+  }
+
   @override
   Future<int> save(Invoice invoice) async {
     final db = await _database.instance;
-    return db.transaction((txn) async {
+    // Image files whose rows disappear during this save, collected inside the
+    // transaction and deleted only once it has actually committed.
+    final orphanedImages = <String>[];
+
+    final invoiceId = await db.transaction<int>((txn) async {
       final supplierId = await _resolveSupplier(txn, invoice);
       final now = DateTime.now().toIso8601String();
       final values = <String, Object?>{
@@ -164,35 +210,46 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
         'updated_at': now,
       };
 
-      late final int invoiceId;
+      late final int id;
       if (invoice.id == null) {
-        invoiceId = await txn.insert('invoices', {
+        id = await txn.insert('invoices', {
           ...values,
           'created_at': invoice.createdAt.toIso8601String(),
         });
       } else {
-        invoiceId = invoice.id!;
-        await txn.update(
-          'invoices',
-          values,
-          where: 'id = ?',
-          whereArgs: [invoiceId],
+        id = invoice.id!;
+        await txn.update('invoices', values, where: 'id = ?', whereArgs: [id]);
+
+        // Work out which image files are being dropped before deleting rows.
+        final keptPaths = invoice.images.map((image) => image.path).toSet();
+        final existing = await txn.query(
+          'invoice_images',
+          columns: ['image_path'],
+          where: 'invoice_id = ?',
+          whereArgs: [id],
         );
+        for (final row in existing) {
+          final path = row['image_path'] as String?;
+          if (path != null && !keptPaths.contains(path)) {
+            orphanedImages.add(path);
+          }
+        }
+
         await txn.delete(
           'invoice_items',
           where: 'invoice_id = ?',
-          whereArgs: [invoiceId],
+          whereArgs: [id],
         );
         await txn.delete(
           'invoice_images',
           where: 'invoice_id = ?',
-          whereArgs: [invoiceId],
+          whereArgs: [id],
         );
       }
 
       for (final item in invoice.items) {
         await txn.insert('invoice_items', {
-          'invoice_id': invoiceId,
+          'invoice_id': id,
           'description': item.description.trim(),
           'quantity': item.quantity,
           'unit_price': item.unitPrice,
@@ -202,32 +259,52 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
       }
       for (final image in invoice.images) {
         await txn.insert('invoice_images', {
-          'invoice_id': invoiceId,
+          'invoice_id': id,
           'image_path': image.path,
           'page_index': image.pageIndex,
           'rotation': image.rotation,
           'ocr_text': image.ocrText,
         });
       }
-      return invoiceId;
+      return id;
     });
+
+    await _deleteFiles(orphanedImages);
+    return invoiceId;
   }
 
   Future<int> _resolveSupplier(Transaction txn, Invoice invoice) async {
+    final taxId = invoice.supplierTaxId.trim();
+    final name = invoice.supplierName.trim();
+
     if (invoice.supplierId != null) {
-      await txn.update(
-        'suppliers',
-        {
-          'name': invoice.supplierName.trim(),
-          'tax_id': invoice.supplierTaxId.trim(),
-        },
-        where: 'id = ?',
-        whereArgs: [invoice.supplierId],
-      );
+      final values = <String, Object?>{'name': name};
+      // Only write the NIT when we actually have one. OCR misses it often, and
+      // blindly copying an empty string used to wipe the NIT already stored
+      // for this supplier in the catalog.
+      if (taxId.isNotEmpty) values['tax_id'] = taxId;
+      try {
+        await txn.update(
+          'suppliers',
+          values,
+          where: 'id = ?',
+          whereArgs: [invoice.supplierId],
+        );
+      } on DatabaseException catch (error) {
+        if (!_isUniqueConstraint(error)) rethrow;
+        // Another supplier already owns this NIT — keep the invoice attached
+        // to its supplier and leave the conflicting NIT out rather than
+        // failing the whole save.
+        await txn.update(
+          'suppliers',
+          {'name': name},
+          where: 'id = ?',
+          whereArgs: [invoice.supplierId],
+        );
+      }
       return invoice.supplierId!;
     }
 
-    final taxId = invoice.supplierTaxId.trim();
     if (taxId.isNotEmpty) {
       final rows = await txn.query(
         'suppliers',
@@ -240,7 +317,7 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
         final id = rows.first['id']! as int;
         await txn.update(
           'suppliers',
-          {'name': invoice.supplierName.trim()},
+          {'name': name},
           where: 'id = ?',
           whereArgs: [id],
         );
@@ -248,7 +325,7 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
       }
     }
     return txn.insert('suppliers', {
-      'name': invoice.supplierName.trim(),
+      'name': name,
       'tax_id': taxId,
       'address': '',
       'phone': '',
@@ -262,12 +339,7 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
     final db = await _database.instance;
     await db.delete('invoices', where: 'id = ?', whereArgs: [id]);
     if (invoice != null) {
-      for (final image in invoice.images) {
-        final file = File(image.path);
-        if (await file.exists()) {
-          await file.delete();
-        }
-      }
+      await _deleteFiles(invoice.images.map((image) => image.path));
     }
   }
 
@@ -344,14 +416,15 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
       '''
       SELECT strftime('%Y-%m', issue_date) AS ym, SUM(total) AS amount
       FROM invoices
-      WHERE status = 'verified' AND issue_date >= ?
+      WHERE status = 'verified' AND issue_date >= ? AND issue_date < ?
       GROUP BY ym
     ''',
-      [trendStart.toIso8601String()],
+      [trendStart.toIso8601String(), nextMonth.toIso8601String()],
     );
     final trendByMonth = <String, double>{
       for (final row in trendRows)
-        row['ym']! as String: (row['amount']! as num).toDouble(),
+        if (row['ym'] != null)
+          row['ym']! as String: (row['amount'] as num?)?.toDouble() ?? 0,
     };
     const monthAbbrev = [
       'Ene',
@@ -411,7 +484,7 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
           .map(
             (row) => SpendSlice(
               label: row['label']! as String,
-              amount: (row['amount']! as num).toDouble(),
+              amount: (row['amount'] as num?)?.toDouble() ?? 0,
             ),
           )
           .toList(growable: false),
@@ -419,7 +492,7 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
           .map(
             (row) => SpendSlice(
               label: row['label']! as String,
-              amount: (row['amount']! as num).toDouble(),
+              amount: (row['amount'] as num?)?.toDouble() ?? 0,
             ),
           )
           .toList(growable: false),
@@ -453,25 +526,33 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
   @override
   Future<int> saveSupplier(Supplier supplier) async {
     final db = await _database.instance;
+    final taxId = supplier.taxId.trim();
     final values = {
       'name': supplier.name.trim(),
-      'tax_id': supplier.taxId.trim(),
+      'tax_id': taxId,
       'address': supplier.address.trim(),
       'phone': supplier.phone.trim(),
     };
-    if (supplier.id == null) {
-      return db.insert('suppliers', {
-        ...values,
-        'created_at': DateTime.now().toIso8601String(),
-      });
+    try {
+      if (supplier.id == null) {
+        return await db.insert('suppliers', {
+          ...values,
+          'created_at': DateTime.now().toIso8601String(),
+        });
+      }
+      await db.update(
+        'suppliers',
+        values,
+        where: 'id = ?',
+        whereArgs: [supplier.id],
+      );
+      return supplier.id!;
+    } on DatabaseException catch (error) {
+      // The NIT is unique by design; surface that as a domain error instead of
+      // letting a raw sqflite exception escape into the widget tree.
+      if (_isUniqueConstraint(error)) throw DuplicateTaxIdException(taxId);
+      rethrow;
     }
-    await db.update(
-      'suppliers',
-      values,
-      where: 'id = ?',
-      whereArgs: [supplier.id],
-    );
-    return supplier.id!;
   }
 
   @override
@@ -480,7 +561,7 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
     try {
       await db.delete('suppliers', where: 'id = ?', whereArgs: [id]);
     } on DatabaseException catch (_) {
-      throw StateError('No se puede eliminar un proveedor con facturas.');
+      throw const SupplierInUseException();
     }
   }
 
@@ -523,6 +604,22 @@ class SqliteInvoiceRepository implements InvoiceRepository, CatalogRepository {
   Future<void> deleteCategory(int id) async {
     final db = await _database.instance;
     await db.delete('categories', where: 'id = ?', whereArgs: [id]);
+  }
+
+  static bool _isUniqueConstraint(DatabaseException error) {
+    if (error.isUniqueConstraintError()) return true;
+    return error.toString().toUpperCase().contains('UNIQUE CONSTRAINT');
+  }
+
+  static Future<void> _deleteFiles(Iterable<String> paths) async {
+    for (final path in paths) {
+      try {
+        final file = File(path);
+        if (await file.exists()) await file.delete();
+      } catch (error) {
+        debugPrint('Could not delete image $path: $error');
+      }
+    }
   }
 
   static String _monthKey(DateTime date) =>

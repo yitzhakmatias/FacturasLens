@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../../application/view_models/invoices_view_model.dart';
 import '../../domain/entities/invoice_category.dart';
 import '../../domain/entities/supplier.dart';
+import '../../domain/ports/catalog_repository.dart';
 import '../core/app_theme.dart';
 import '../widgets/confirm_dialogs.dart';
 import '../widgets/empty_state.dart';
@@ -73,8 +74,21 @@ class _SuppliersTab extends StatelessWidget {
       context: context,
       builder: (_) => _SupplierFormDialog(existing: existing),
     );
-    if (result != null && context.mounted) {
+    if (result == null || !context.mounted) return;
+    try {
       await context.read<InvoicesViewModel>().saveSupplier(result);
+    } on DuplicateTaxIdException catch (error) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Ya existe otro proveedor con el NIT ${error.taxId}.'),
+        ),
+      );
+    } catch (exception) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('No se pudo guardar el proveedor: $exception')),
+      );
     }
   }
 
@@ -92,8 +106,8 @@ class _SuppliersTab extends StatelessWidget {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              exception is StateError
-                  ? exception.message
+              exception is SupplierInUseException
+                  ? 'No se puede eliminar un proveedor con facturas.'
                   : 'No se pudo eliminar el proveedor.',
             ),
           ),

@@ -11,7 +11,10 @@ abstract final class AppRoutes {
   static Route<dynamic> onGenerateRoute(RouteSettings settings) {
     switch (settings.name) {
       case capture:
-        return MaterialPageRoute<void>(
+        // Must be <bool>: callers use pushNamed<bool> and CapturePage pops
+        // with `true` after a save. A <void> route fails the Navigator's
+        // `as Route<bool?>` cast and the tap silently does nothing.
+        return MaterialPageRoute<bool>(
           settings: settings,
           builder: (_) => const CapturePage(),
         );

@@ -10,6 +10,14 @@ class CapturedDocumentSection {
   final String path;
   final String ocrText;
   final int pageIndex;
+
+  CapturedDocumentSection copyWith({int? pageIndex}) {
+    return CapturedDocumentSection(
+      path: path,
+      ocrText: ocrText,
+      pageIndex: pageIndex ?? this.pageIndex,
+    );
+  }
 }
 
 abstract interface class DocumentCapturePort {

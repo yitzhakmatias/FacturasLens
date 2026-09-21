@@ -35,6 +35,12 @@ class CaptureViewModel extends ChangeNotifier {
   Future<void> removeSection(int index) async {
     if (index < 0 || index >= _sections.length) return;
     final section = _sections.removeAt(index);
+    // Page indices are positional. Leaving the old ones in place lets the next
+    // capture reuse an index (it is assigned from `_sections.length`), which
+    // scrambles the OCR merge order and writes duplicate page_index rows.
+    for (var i = 0; i < _sections.length; i++) {
+      _sections[i] = _sections[i].copyWith(pageIndex: i);
+    }
     notifyListeners();
     await _delete(section);
   }

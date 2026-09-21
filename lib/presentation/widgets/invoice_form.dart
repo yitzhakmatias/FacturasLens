@@ -53,6 +53,11 @@ class _InvoiceFormState extends State<InvoiceForm> {
   late DateTime _issueDate;
   int? _categoryId;
   late List<InvoiceItem> _items;
+  final FocusNode _supplierFocus = FocusNode();
+
+  /// Catalog supplier picked from the autocomplete, if any. Picking one
+  /// attaches the invoice to that supplier instead of creating a twin.
+  Supplier? _pickedSupplier;
 
   @override
   void initState() {
@@ -78,13 +83,39 @@ class _InvoiceFormState extends State<InvoiceForm> {
     }
   }
 
-  void _refresh() => setState(() {});
+  void _refresh() {
+    // Typing over a picked supplier's name means it is no longer that one.
+    final picked = _pickedSupplier;
+    if (picked != null && _supplierName.text.trim() != picked.name) {
+      _pickedSupplier = null;
+    }
+    setState(() {});
+  }
+
+  void _pickSupplier(Supplier supplier) {
+    _pickedSupplier = supplier;
+    if (supplier.taxId.isNotEmpty) _supplierTaxId.text = supplier.taxId;
+    setState(() {});
+  }
+
+  Iterable<Supplier> _supplierOptions(TextEditingValue value) {
+    final query = value.text.trim().toLowerCase();
+    if (query.length < 2) return const [];
+    return widget.suppliers
+        .where(
+          (supplier) =>
+              supplier.name.toLowerCase().contains(query) ||
+              (supplier.taxId.isNotEmpty && supplier.taxId.contains(query)),
+        )
+        .take(6);
+  }
 
   @override
   void dispose() {
     for (final controller in [_supplierName, _number, _subtotal, _total]) {
       controller.removeListener(_refresh);
     }
+    _supplierFocus.dispose();
     _supplierName.dispose();
     _supplierTaxId.dispose();
     _number.dispose();
@@ -109,6 +140,7 @@ class _InvoiceFormState extends State<InvoiceForm> {
 
   Invoice _buildInvoice(InvoiceStatus status) {
     return widget.invoice.copyWith(
+      supplierId: _pickedSupplier?.id,
       supplierName: _supplierName.text.trim().isEmpty
           ? 'Proveedor por revisar'
           : _supplierName.text.trim(),
@@ -228,10 +260,47 @@ class _InvoiceFormState extends State<InvoiceForm> {
         _SectionCard(
           title: 'Proveedor',
           children: [
-            ReviewField(
-              controller: _supplierName,
-              label: 'Nombre o razón social',
-              suspect: supplierSuspect,
+            RawAutocomplete<Supplier>(
+              textEditingController: _supplierName,
+              focusNode: _supplierFocus,
+              optionsBuilder: _supplierOptions,
+              displayStringForOption: (supplier) => supplier.name,
+              onSelected: _pickSupplier,
+              fieldViewBuilder: (context, controller, focusNode, _) =>
+                  ReviewField(
+                    controller: controller,
+                    focusNode: focusNode,
+                    label: 'Nombre o razón social',
+                    suspect: supplierSuspect,
+                  ),
+              optionsViewBuilder: (context, onSelected, options) => Align(
+                alignment: Alignment.topLeft,
+                child: Material(
+                  elevation: 4,
+                  borderRadius: BorderRadius.circular(12),
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(
+                      maxHeight: 260,
+                      maxWidth: 420,
+                    ),
+                    child: ListView(
+                      padding: EdgeInsets.zero,
+                      shrinkWrap: true,
+                      children: [
+                        for (final supplier in options)
+                          ListTile(
+                            dense: true,
+                            title: Text(supplier.name),
+                            subtitle: supplier.taxId.isEmpty
+                                ? null
+                                : Text('NIT ${supplier.taxId}'),
+                            onTap: () => onSelected(supplier),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
             ),
             const SizedBox(height: 14),
             ReviewField(

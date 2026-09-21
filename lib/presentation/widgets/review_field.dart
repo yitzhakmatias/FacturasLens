@@ -18,6 +18,7 @@ class ReviewField extends StatelessWidget {
     this.onTap,
     this.readOnly = false,
     this.suffixIcon,
+    this.focusNode,
   });
 
   final TextEditingController controller;
@@ -29,11 +30,13 @@ class ReviewField extends StatelessWidget {
   final VoidCallback? onTap;
   final bool readOnly;
   final Widget? suffixIcon;
+  final FocusNode? focusNode;
 
   @override
   Widget build(BuildContext context) {
     return TextField(
       controller: controller,
+      focusNode: focusNode,
       keyboardType: keyboardType,
       maxLines: maxLines,
       enabled: enabled,

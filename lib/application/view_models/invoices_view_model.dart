@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import '../../domain/entities/dashboard_stats.dart';
@@ -30,21 +32,27 @@ class InvoicesViewModel extends ChangeNotifier {
     error = null;
     notifyListeners();
     try {
-      final results = await Future.wait<Object>([
-        _invoiceRepository.findAll(
-          query: query,
-          status: statusFilter,
-          categoryId: categoryFilter,
-        ),
-        _catalogRepository.findCategories(),
-        _catalogRepository.findSuppliers(),
-        _invoiceRepository.dashboardStats(DateTime.now()),
-      ]);
-      invoices = results[0] as List<Invoice>;
-      categories = results[1] as List<InvoiceCategory>;
-      suppliers = results[2] as List<Supplier>;
-      stats = results[3] as DashboardStats;
+      // A record `.wait` keeps the four queries parallel while staying
+      // statically typed — the old `Future.wait([...])` plus `results[0] as
+      // List<Invoice>` compiled happily even if the order drifted.
+      final (invoiceList, categoryList, supplierList, dashboard) =
+          await (
+            _invoiceRepository.findAll(
+              query: query,
+              status: statusFilter,
+              categoryId: categoryFilter,
+            ),
+            _catalogRepository.findCategories(),
+            _catalogRepository.findSuppliers(),
+            _invoiceRepository.dashboardStats(DateTime.now()),
+          ).wait;
+
+      invoices = invoiceList;
+      categories = categoryList;
+      suppliers = supplierList;
+      stats = dashboard;
     } catch (exception) {
+      // Includes ParallelWaitError, whose toString lists the failed futures.
       error = 'No se pudieron cargar los datos: $exception';
     } finally {
       isLoading = false;
@@ -71,6 +79,19 @@ class InvoicesViewModel extends ChangeNotifier {
       categoryFilter = categoryId;
     }
     await load();
+  }
+
+  /// Looks for an already-stored invoice that matches [candidate].
+  ///
+  /// Goes to the repository rather than scanning [invoices], which only holds
+  /// whatever passed the active filters.
+  Future<Invoice?> findDuplicate(Invoice candidate) {
+    return _invoiceRepository.findDuplicate(
+      number: candidate.number,
+      supplierName: candidate.supplierName,
+      issueDate: candidate.issueDate,
+      excludingId: candidate.id,
+    );
   }
 
   Future<int> saveInvoice(Invoice invoice) async {

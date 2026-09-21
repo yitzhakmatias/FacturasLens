@@ -2,8 +2,14 @@ import '../../domain/entities/invoice.dart';
 import '../../domain/entities/invoice_image.dart';
 import '../../domain/entities/invoice_item.dart';
 import '../../domain/ports/document_capture_port.dart';
+import 'qr_parser.dart';
 
 class ReceiptParser {
+  const ReceiptParser({QrParser qrParser = const QrParser()})
+    : _qrParser = qrParser;
+
+  final QrParser _qrParser;
+
   Invoice parse(
     List<CapturedDocumentSection> sections, {
     String qrContent = '',
@@ -23,36 +29,45 @@ class ReceiptParser {
         _moneyAfterLabel(normalized, 'MONTO A PAGAR') ??
         subtotal;
 
+    // The QR is machine-written, so anything it yields beats the OCR guess.
+    final qr = qrContent.trim().isEmpty
+        ? const QrInvoiceData()
+        : _qrParser.parse(qrContent);
+
     return Invoice(
       supplierName: _supplierName(lines),
       supplierTaxId:
+          qr.supplierTaxId ??
           _firstGroup(
             normalized,
             RegExp(r'(?:^|\n)\s*NIT\s*[:.]?\s*(\d{5,})'),
           ) ??
           '',
       number:
+          qr.number ??
           _firstGroup(
             normalized,
             RegExp(r'FACTURA\s*(?:N[RO°º.]*)?\s*[:.]?\s*(\d+)'),
           ) ??
           '',
       authorizationCode:
+          qr.authorizationCode ??
           _firstGroup(
             normalized,
             RegExp(r'(?:COD\.?\s*)?AUTORIZACI[OÓ]N\s*[:.]?\s*([A-Z0-9]+)'),
           ) ??
           '',
       fiscalCode:
+          qr.fiscalCode ??
           _firstGroup(
             normalized,
             RegExp(r'(?:CUF|C[OÓ]DIGO\s+FISCAL)\s*[:.]?\s*([A-Z0-9]+)'),
           ) ??
           '',
-      issueDate: _parseDate(normalized) ?? now,
+      issueDate: qr.issueDate ?? _parseDate(normalized) ?? now,
       subtotal: subtotal,
       discount: discount,
-      total: total,
+      total: qr.total ?? total,
       paymentMethod: _paymentMethod(lines),
       qrContent: qrContent,
       rawOcrText: rawText,
@@ -154,15 +169,41 @@ class ReceiptParser {
     return double.tryParse(value.replaceAll(',', '.'));
   }
 
+  /// Reads the issue date.
+  ///
+  /// A labelled match (`FECHA DE EMISION: …`) always wins; only if there is no
+  /// label do we fall back to the first date-shaped token in the document,
+  /// which is a coin flip on receipts that also print a due date or a promo
+  /// date. Impossible dates are rejected rather than silently rolled over by
+  /// [DateTime] — `DateTime(2026, 13, 45)` quietly becomes February 2027.
   DateTime? _parseDate(String text) {
-    final match = RegExp(
-      r'(?:FECHA(?:\s+DE)?\s+EMISION)?[^\d]{0,10}(\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4})',
+    const datePattern =
+        r'(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4})';
+    final labelled = RegExp(
+      r'FECHA(?:\s+DE)?\s*(?:EMISI[OÓ]N)?\s*[:.]?[^\d\n]{0,10}' + datePattern,
     ).firstMatch(text);
+    final match = labelled ?? RegExp(datePattern).firstMatch(text);
     final value = match?.group(1);
     if (value == null) return null;
-    final parts = value.split(RegExp('[-/]')).map(int.parse).toList();
-    if (parts.first > 31) return DateTime(parts[0], parts[1], parts[2]);
-    return DateTime(parts[2], parts[1], parts[0]);
+
+    final parts = value.split(RegExp('[-/]')).map(int.tryParse).toList();
+    if (parts.any((part) => part == null)) return null;
+    final numbers = parts.cast<int>();
+    if (numbers.first > 31) {
+      return _safeDate(numbers[0], numbers[1], numbers[2]);
+    }
+    return _safeDate(numbers[2], numbers[1], numbers[0]);
+  }
+
+  DateTime? _safeDate(int year, int month, int day) {
+    if (year < 2000 || year > 2100) return null;
+    if (month < 1 || month > 12) return null;
+    if (day < 1 || day > 31) return null;
+    final date = DateTime(year, month, day);
+    if (date.year != year || date.month != month || date.day != day) {
+      return null;
+    }
+    return date;
   }
 
   String _paymentMethod(List<String> lines) {

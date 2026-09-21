@@ -4,23 +4,36 @@ import 'package:path/path.dart' as p;
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
 class AppDatabase {
-  Database? _database;
+  /// The in-flight (or completed) open operation.
+  ///
+  /// This caches the *future*, not the database. Caching the database means
+  /// every caller that arrives before `openDatabase` completes sees `null` and
+  /// opens its own handle — and the very first thing the app does is fire four
+  /// concurrent queries through `Future.wait`, so that race happened on every
+  /// cold start.
+  Future<Database>? _opening;
 
-  Future<Database> get instance async {
-    if (_database != null) return _database!;
-    if (Platform.isWindows || Platform.isLinux) {
-      sqfliteFfiInit();
-      databaseFactory = databaseFactoryFfi;
+  Future<Database> get instance => _opening ??= _open();
+
+  Future<Database> _open() async {
+    try {
+      if (Platform.isWindows || Platform.isLinux) {
+        sqfliteFfiInit();
+        databaseFactory = databaseFactoryFfi;
+      }
+      final root = await getDatabasesPath();
+      return await openDatabase(
+        p.join(root, 'facturalens.db'),
+        version: 2,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
+        onCreate: _createSchema,
+        onUpgrade: _upgradeSchema,
+      );
+    } catch (_) {
+      // Don't cache a failed open: the next caller should be able to retry.
+      _opening = null;
+      rethrow;
     }
-    final root = await getDatabasesPath();
-    _database = await openDatabase(
-      p.join(root, 'facturalens.db'),
-      version: 1,
-      onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
-      onCreate: _createSchema,
-      onUpgrade: _upgradeSchema,
-    );
-    return _database!;
   }
 
   Future<void> _createSchema(Database db, int version) async {
@@ -76,6 +89,8 @@ class AppDatabase {
     batch.execute('''
       CREATE INDEX idx_invoices_status ON invoices(status)
     ''');
+    // Backs the duplicate lookup performed before confirming an invoice.
+    batch.execute(_duplicateIndex);
     batch.execute('''
       CREATE TABLE invoice_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,16 +134,29 @@ class AppDatabase {
     await seed.commit(noResult: true);
   }
 
+  /// v2: index backing the duplicate-invoice lookup.
+  static const String _duplicateIndex = '''
+      CREATE INDEX IF NOT EXISTS idx_invoices_duplicate
+      ON invoices(supplier_id, invoice_number)
+    ''';
+
   Future<void> _upgradeSchema(
     Database db,
     int oldVersion,
     int newVersion,
   ) async {
-    // Version 1 is the initial schema. Future migrations belong here.
+    // Version 1 is the initial schema. Each migration is additive and guarded
+    // so re-running it on a partially migrated database is harmless.
+    if (oldVersion < 2) {
+      await db.execute(_duplicateIndex);
+    }
   }
 
   Future<void> close() async {
-    await _database?.close();
-    _database = null;
+    final opening = _opening;
+    _opening = null;
+    if (opening == null) return;
+    final db = await opening;
+    await db.close();
   }
 }

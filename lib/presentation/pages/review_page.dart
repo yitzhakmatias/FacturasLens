@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../../application/view_models/invoices_view_model.dart';
 import '../../domain/entities/invoice.dart';
+import '../core/formatters.dart';
 import '../widgets/confirm_dialogs.dart';
 import '../widgets/image_carousel.dart';
 import '../widgets/invoice_form.dart';
@@ -22,42 +23,50 @@ class ReviewPage extends StatefulWidget {
 class _ReviewPageState extends State<ReviewPage> {
   bool _saving = false;
 
-  bool _looksDuplicate(Invoice candidate, List<Invoice> existing) {
-    if (candidate.number.trim().isEmpty) return false;
-    return existing.any(
-      (invoice) =>
-          invoice.id != candidate.id &&
-          invoice.number.trim() == candidate.number.trim() &&
-          invoice.supplierName.trim().toLowerCase() ==
-              candidate.supplierName.trim().toLowerCase() &&
-          invoice.issueDate.year == candidate.issueDate.year &&
-          invoice.issueDate.month == candidate.issueDate.month &&
-          invoice.issueDate.day == candidate.issueDate.day,
-    );
-  }
-
   Future<void> _handleSave(Invoice invoice) async {
     final model = context.read<InvoicesViewModel>();
-    if (invoice.status == InvoiceStatus.verified &&
-        _looksDuplicate(invoice, model.invoices)) {
-      final proceed = await showConfirmDialog(
-        context,
-        title: 'Posible factura duplicada',
-        message:
-            'Ya existe una factura de "${invoice.supplierName}" con el '
-            'mismo número y fecha. ¿Guardar de todas formas?',
-        confirmLabel: 'Guardar de todas formas',
-      );
-      if (!proceed) return;
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+
+    if (invoice.status == InvoiceStatus.verified) {
+      // Asks the database, not the in-memory list: that list is filtered by
+      // whatever search/status/category the user left active, so a real
+      // duplicate could easily be missing from it.
+      final Invoice? existing;
+      try {
+        existing = await model.findDuplicate(invoice);
+      } catch (exception) {
+        messenger.showSnackBar(
+          SnackBar(
+            content: Text('No se pudo verificar duplicados: $exception'),
+          ),
+        );
+        return;
+      }
+      if (existing != null) {
+        if (!mounted) return;
+        final proceed = await showConfirmDialog(
+          context,
+          title: 'Posible factura duplicada',
+          message:
+              'Ya existe una factura de "${existing.supplierName}" '
+              'N.º ${existing.number} del '
+              '${AppFormatters.shortDate(existing.issueDate)} por '
+              '${AppFormatters.money(existing.total)}. '
+              '¿Guardar de todas formas?',
+          confirmLabel: 'Guardar de todas formas',
+        );
+        if (!proceed || !mounted) return;
+      }
     }
 
     setState(() => _saving = true);
     try {
       await model.saveInvoice(invoice);
-      if (mounted) Navigator.of(context).pop(true);
+      navigator.pop(true);
     } catch (exception) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
+        messenger.showSnackBar(
           SnackBar(content: Text('No se pudo guardar la factura: $exception')),
         );
       }
